@@ -1,68 +1,165 @@
 # Game Analytics Lakehouse
 
-End-to-end **data engineering pipeline on Databricks**: simulated game telemetry flows through a
-**medallion architecture (Bronze → Silver → Gold)** with incremental loads, idempotent upserts,
-automated data-quality gates and a published dashboard.
+An end-to-end data engineering pipeline on **Databricks** that ingests raw game telemetry, cleans it, checks its quality, models it into a star schema, and serves analytics through a dashboard. It runs as a scheduled, orchestrated job and handles new data incrementally and idempotently.
 
-> Built with: Databricks (Free Edition), PySpark, Delta Lake, Auto Loader, Databricks Workflows, SQL, Python
+**Stack:** PySpark, Delta Lake, Auto Loader, Databricks Workflows, SQL, Python
 
-## Why this project
-<2-3 sentences: you wanted to practise production-style pipeline patterns (incremental, idempotent, tested)
-on a domain you care about: games.>
+![Dashboard](docs/dashboard.png)
+
+---
 
 ## Architecture
-![architecture](docs/architecture.png)
 
-| Layer | Tables | What happens |
-|---|---|---|
-| Bronze | `bronze_events`, `bronze_games`, `bronze_players` | Raw data landed as-is via Auto Loader, plus audit columns |
-| Silver | `silver_events`, `silver_rejects`, `silver_games`, `silver_players` | Typed, standardised, deduplicated. Bad rows quarantined with a reason |
-| Quality gate | `dq_results` | 9 automated checks; failure stops the job before Gold |
-| Gold | `fact_events`, `dim_game`, `dim_player`, `gold_daily_active_users`, `gold_retention`, `gold_daily_revenue_by_game`, `gold_top_games_by_genre` | Star schema + business marts |
+```
+Raw JSON/CSV files (Unity Catalog Volume)
+        |
+        v   Auto Loader (incremental, availableNow)
+   BRONZE   raw strings + audit columns, nothing dropped
+        |
+        v   clean, dedupe, MERGE on event_id
+   SILVER   typed, validated, deduplicated events
+        |         \
+        |          `--> silver_rejects  (bad rows quarantined with a reason)
+        v   quality gate (9 checks, fails the job on any failure)
+    GOLD    star schema + analytics marts
+        |
+        v
+  Dashboard (5 visuals)
+```
 
-## Data
-Python generator produces ~<N>K events across <14> days for <60,000> players and <40> games, with
-**deliberately injected problems**: duplicates (2%), null player IDs, misspelled event types,
-mixed timestamp formats, invalid purchase amounts, late-arriving events.
+Orchestrated by the Databricks Job `game-analytics-daily`: **bronze -> silver -> quality -> gold**, running daily at 06:00 IST with retries and failure email alerts.
 
-## Key engineering decisions
-- **Incremental ingestion**: Auto Loader with `availableNow` trigger; only new files are processed.
-- **Idempotency**: Silver uses `MERGE ... WHEN NOT MATCHED` on `event_id`; reruns never duplicate data.
-- **Quarantine over deletion**: invalid rows land in `silver_rejects` with `reject_reason` (<X>% reject rate).
-- **ANSI-safe parsing**: `try_to_timestamp` / `try_cast` so bad values become NULL instead of crashing the job.
-- **Fail-fast quality gate**: the workflow halts if any check fails, so Gold never publishes bad data.
-- **Rebuildable Gold**: `CREATE OR REPLACE TABLE ... AS SELECT` so late data is always reflected.
+![Workflow DAG](docs/workflow-dag.PNG)
+
+---
+
+## The data
+
+Databricks Free Edition restricts outbound internet, so the data is generated locally by `01_generate_data.py`: simulated telemetry for **60,000 players** and **40 games** over **Sept 1-15, 2026**. It is deliberately dirty, with duplicates, null keys, mixed timestamp formats, invalid event types, and bad purchase amounts, so the cleaning and quality logic has real work to do.
+
+---
+
+## Layers
+
+### Bronze: ingest everything, change nothing
+- Auto Loader (`cloudFiles`) with `trigger(availableNow=True)` reads only new files, so reruns never duplicate data.
+- All fields are kept as raw strings, plus audit columns (source file, ingest time).
+- Tables: `bronze_events`, `bronze_games`, `bronze_players`.
+
+### Silver: clean, validate, deduplicate
+- Parsing uses `try_to_timestamp` and `try_cast`, which return NULL instead of crashing. Serverless compute runs in ANSI mode, where a strict cast on dirty data would fail the whole job.
+- Bad rows are **quarantined, not deleted**, into `silver_rejects` with a `reject_reason`.
+- Duplicates are removed with `row_number()` over `event_id`.
+- Writes use an idempotent `MERGE INTO ... WHEN NOT MATCHED` on `event_id`, so rerunning the pipeline never double-counts.
+
+Reject breakdown from the initial load:
+
+![Silver reject breakdown](docs/reject-breakdown-table.PNG)
+
+### Quality gate: fail fast before Gold
+Nine automated checks are logged to `dq_results`, and the job **raises an exception if any check fails**, so bad data never reaches the marts:
+
+`silver_not_empty`, `no_null_keys`, `no_duplicate_event_ids`, `valid_event_types`, `purchase_amount_positive`, `amount_only_on_purchases`, `game_ids_exist_in_dim`, `row_reconciliation`, `reject_rate_under_5pct`
+
+The gate was tested by inserting a bad row on purpose: `no_null_keys` failed as expected and blocked the run.
+
+![Gate failure: check table](docs/dq-gate-failure.PNG)
+![Gate failure: job exception](docs/dq-gate-failure-2.PNG)
+
+After removing the bad row, all checks pass again:
+
+![All checks passed](docs/dq-result-2.PNG)
+
+### Gold: analytics-ready
+- Star schema: `fact_events`, `dim_game`, `dim_player`.
+- Marts: `gold_daily_active_users`, `gold_retention` (D1 / D7), `gold_daily_revenue_by_game`, `gold_top_games_by_genre`.
+- Rebuilt with `CREATE OR REPLACE TABLE ... AS SELECT`, so late-arriving data is always reflected.
+- D7 retention is correctly `NULL` for cohorts whose 7-day window is not complete yet.
+
+Daily active users (initial load):
+
+![Gold DAU](docs/gold-dau.PNG)
+
+D1 / D7 retention by cohort:
+
+![Gold retention](docs/gold-retention.PNG)
+
+Top games per genre:
+
+![Gold top games by genre](docs/gold-top-games-by-genre.PNG)
+
+---
 
 ## Results
-- <N> raw events → <N> clean events, <N> rejected, <N> duplicates removed
-- Pipeline runs daily via Databricks Workflows with retries and failure alerts
 
-![dashboard](docs/dashboard.png)
-![workflow](docs/workflow_dag.png)
-![dq](docs/dq_results.png)
+| Metric | Value |
+|---|---|
+| Raw events ingested (Bronze) | **919,875** |
+| Clean events (Silver) | **887,727** |
+| Rejected events (quarantined) | **14,414** (1.57% reject rate) |
+| Duplicates dropped | ~17,734 |
+| Reconciliation | Bronze = Silver + Rejects + Duplicates |
+| Quality checks passing | **9 / 9** |
+| Daily active users | Grew from 2,162 (Sept 1) to roughly 12,500 by mid-period |
+| D1 retention | ~75-79% |
+| D7 retention | ~30-35% |
 
-## How to run
-1. Create a Databricks Free Edition workspace; import `notebooks/` (or add this repo as a Git folder).
-2. Run `01_generate_data` to create the raw files.
-3. Run the workflow (or `06_run_all`): bronze → silver → quality checks → gold.
-4. Open the dashboard / query the `gold_*` tables.
-5. To test incremental loads: run `01_generate_data` with `start_date=2026-09-15`, `num_days=1`, then rerun the workflow.
+Initial-load reject reasons: `missing_player_id` (8,347), `invalid_event_type` (4,134), `invalid_purchase_amount` (503).
+
+Quality gate results and row reconciliation from the initial load:
+
+![Data quality results](docs/dq-result.PNG)
+![Bronze / Silver reconciliation](docs/reject-reconciliation-table.PNG)
+
+---
+
+## Incremental load demo
+
+To prove the pipeline is incremental and idempotent end to end, I loaded a new day (**2026-09-15, 90,192 events**) and ran the full orchestrated job:
+
+| Table | Before | After |
+|---|---|---|
+| `bronze_events` | 829,683 | 919,875 (+90,192) |
+| `silver_events` | 800,697 | 887,727 (+87,030) |
+| `gold_daily_active_users` | no Sept 15 row | Sept 15 row added |
+
+Only the new file was processed, and existing rows were not duplicated.
+
+Before the incremental run:
+
+![Before incremental load](docs/incremental_load_before.PNG)
+
+After the incremental run:
+
+![After incremental load](docs/incremental_load_after.PNG)
+
+---
 
 ## Repo structure
+
 ```
 notebooks/
-  00_config.py           shared names and paths
-  01_generate_data.py    simulated source systems (dirty data)
-  02_bronze.py           Auto Loader ingestion
-  03_silver.py           clean, validate, dedupe, MERGE
-  04_quality_checks.py   quality gate
-  05_gold.py             star schema and marts
-  06_run_all.py          fallback runner
-docs/                    diagram and screenshots
+  00_config.py          shared config (catalog, schema, paths)
+  01_generate_data.py   dirty telemetry generator
+  02_bronze.py          Auto Loader ingestion
+  03_silver.py          cleaning, quarantine, dedup, MERGE
+  04_quality_checks.py  9-check quality gate
+  05_gold.py            star schema and marts
+  06_run_all.py         local run-all helper
+docs/                   screenshots
 ```
 
-## What I would do next
-- Replace the file generator with Kafka + Structured Streaming
-- Liquid clustering on `event_date`; incremental Gold instead of full rebuild
-- CI with pytest and Databricks Asset Bundles for deployment
-- Churn-prediction model (XGBoost) on a player-features table
+## How to run
+
+1. Import this repo into Databricks as a Git folder.
+2. Run `01_generate_data.py` to create raw files in `/Volumes/workspace/game_analytics/raw`.
+3. Run notebooks `02` to `05` in order, or create a Job with the four chained tasks (bronze, silver, quality, gold).
+4. To simulate a new day, regenerate data for a single date using the notebook widget, then rerun the job.
+
+## Design decisions
+
+- **Medallion architecture:** raw data stays replayable in Bronze, while Silver and Gold can be rebuilt without re-ingesting.
+- **Idempotency:** `MERGE` on the event key means retries and reruns are safe.
+- **Quarantine instead of delete:** rejected rows stay auditable, and reject rates can be monitored.
+- **Fail-fast quality gate:** bad data is stopped between Silver and Gold, not discovered in a dashboard.
+- **Scaling path:** the same design extends to streaming sources such as Kafka by swapping the Auto Loader source for a streaming read.
