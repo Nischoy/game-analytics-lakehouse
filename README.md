@@ -152,9 +152,11 @@ docs/                   screenshots
 ## How to run
 
 1. Import this repo into Databricks as a Git folder.
-2. Run `01_generate_data.py` to create raw files in `/Volumes/workspace/game_analytics/raw`.
-3. Run notebooks `02` to `05` in order, or create a Job with the four chained tasks (bronze, silver, quality, gold).
-4. To simulate a new day, regenerate data for a single date using the notebook widget, then rerun the job.
+2. Run `01_generate_data.py` to create the raw files in `/Volumes/workspace/game_analytics/raw`.
+3. **Run the pipeline as a Job (primary path).** Create a Databricks Job with four chained tasks on serverless compute: `02_bronze` -> `03_silver` -> `04_quality_checks` -> `05_gold`, each depending on the one before. Click **Run now**, or add a schedule (this project runs daily at 06:00 IST). A failed quality check stops the run before Gold is built.
+4. **Simulate a new day.** Use the notebook widget UI to regenerate data for a single date, then run the Job again. Only the new files are ingested, and existing rows are not duplicated.
+
+**Fallback:** to debug a single layer, run notebooks `02` to `05` manually in order.
 
 ## Design decisions
 
